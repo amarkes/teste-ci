@@ -17,40 +17,48 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
 
-      # Resolve repositório de origem dos artifacts (pode vir no payload)
+      # Resolve o repositório de origem dos artifacts e o run_id
       - name: Resolver repo de origem
         id: src
         run: |
           OWNER="${{ github.event.client_payload.source_owner }}"
           REPO="${{ github.event.client_payload.source_repo }}"
+          RUN_ID="${{ github.event.client_payload.workflow_run_id }}"
+
+          # Fallback: se não vier no payload, usa o próprio repo receiver
           if [ -z "$OWNER" ]; then OWNER="${{ github.repository_owner }}"; fi
           if [ -z "$REPO" ]; then REPO="${{ github.event.repository.name }}"; fi
+
           echo "owner=$OWNER" >> $GITHUB_OUTPUT
           echo "repo=$REPO" >> $GITHUB_OUTPUT
-          echo "run_id=${{ github.event.client_payload.workflow_run_id }}" >> $GITHUB_OUTPUT
-          echo "Artifact Android: ${{ github.event.client_payload.artifact_names.android_apk }}"
-          echo "Artifact iOS:     ${{ github.event.client_payload.artifact_names.ios_ipa }}"
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+
+          echo "Artifact Android esperado: ${{ github.event.client_payload.artifact_names.android_apk }}"
+          echo "Artifact iOS esperado:     ${{ github.event.client_payload.artifact_names.ios_ipa }}"
 
       - name: Listar artifacts do run (debug robusto)
         run: |
           URL="https://api.github.com/repos/${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }}/actions/runs/${{ steps.src.outputs.run_id }}/artifacts"
           echo "GET $URL"
           RESP_FILE=$(mktemp)
-          HTTP_CODE=$(curl -sS -w "\n%{http_code}\n" -H "Accept: application/vnd.github+json" \
-            -H "Authorization: token ${{ secrets.REPO_ACCESS_TOKEN }}" "$URL" > "$RESP_FILE")
+          curl -sS -w "\n%{http_code}\n" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ secrets.REPO_ACCESS_TOKEN }}" \
+            "$URL" > "$RESP_FILE"
           BODY=$(head -n -1 "$RESP_FILE")
           CODE=$(tail -n 1 "$RESP_FILE")
           echo "HTTP $CODE"
+          # Mostra chaves para diagnóstico (pode ser message/ documentation_url em erros)
           echo "$BODY" | jq 'keys' || true
           echo "---- Lista (se houver) ----"
           echo "$BODY" | jq -r '.artifacts // [] | .[] | "\(.id)\t\(.name)\texpired=\(.expired)"'
-          # Falhas comuns:
+
           if [ "$CODE" = "404" ]; then
             echo "::error::404 Not Found - Verifique owner/repo e se o run_id pertence a esse repo."
             exit 1
           fi
           if [ "$CODE" = "403" ]; then
-            echo "::error::403 Forbidden - Token sem acesso/SSO não autorizado à org."
+            echo "::error::403 Forbidden - Token sem acesso, ou SSO não autorizado na org."
             exit 1
           fi
 
@@ -59,7 +67,7 @@ jobs:
         uses: dawidd6/action-download-artifact@v2
         with:
           github_token: ${{ secrets.REPO_ACCESS_TOKEN }}
-          owner: ${{ steps.src.outputs.owner }}   # << repo de origem correto
+          owner: ${{ steps.src.outputs.owner }}
           repo: ${{ steps.src.outputs.repo }}
           run_id: ${{ steps.src.outputs.run_id }}
           name: ${{ github.event.client_payload.artifact_names.android_apk }}
@@ -70,7 +78,7 @@ jobs:
         uses: dawidd6/action-download-artifact@v2
         with:
           github_token: ${{ secrets.REPO_ACCESS_TOKEN }}
-          owner: ${{ steps.src.outputs.owner }}   # << repo de origem correto
+          owner: ${{ steps.src.outputs.owner }}
           repo: ${{ steps.src.outputs.repo }}
           run_id: ${{ steps.src.outputs.run_id }}
           name: ${{ github.event.client_payload.artifact_names.ios_ipa }}
@@ -120,6 +128,7 @@ jobs:
             echo "### BrowserStack Upload Summary"
             echo ""
             echo "**Source repo:** ${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }}"
+            echo "**Run ID:**      ${{ steps.src.outputs.run_id }}"
             echo "**Platform:**    ${{ github.event.client_payload.platform }}"
             echo "**Version:**     ${{ github.event.client_payload.version }}"
             echo "**Build:**       ${{ github.event.client_payload.build }}"
