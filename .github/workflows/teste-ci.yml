@@ -1,4 +1,4 @@
-name: BrowserStack Tests
+name: CI - TESTE
 
 on:
   repository_dispatch:
