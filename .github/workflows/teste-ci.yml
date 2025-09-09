@@ -12,32 +12,58 @@ jobs:
   upload-apps:
     runs-on: ubuntu-latest
     steps:
-      - name: Instalar jq (garantia)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
 
-      # Resolve o repositório de origem dos artifacts e o run_id
-      - name: Resolver repo de origem
+
+      # Deriva owner/repo/run_id a partir do payload (prioridade):
+      # 1) source_owner/source_repo + workflow_run_id
+      # 2) workflow_run_url (parseia owner/repo/run_id da URL)
+      # 3) fallback: repo atual + workflow_run_id (menos recomendado)
+      - name: Resolver repo de origem e run_id
         id: src
+        shell: bash
         run: |
+          set -euo pipefail
+
           OWNER="${{ github.event.client_payload.source_owner }}"
           REPO="${{ github.event.client_payload.source_repo }}"
           RUN_ID="${{ github.event.client_payload.workflow_run_id }}"
+          RUN_URL="${{ github.event.client_payload.workflow_run_url }}"
 
-          # Fallback: se não vier no payload, usa o próprio repo receiver
-          if [ -z "$OWNER" ]; then OWNER="${{ github.repository_owner }}"; fi
-          if [ -z "$REPO" ]; then REPO="${{ github.event.repository.name }}"; fi
+          parse_from_url() {
+            local url="$1"
+            # Espera formato: https://github.com/<owner>/<repo>/actions/runs/<id>
+            if [[ "$url" =~ github\.com/([^/]+)/([^/]+)/actions/runs/([0-9]+) ]]; then
+              echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+              return 0
+            fi
+            return 1
+          }
 
-          echo "owner=$OWNER" >> $GITHUB_OUTPUT
-          echo "repo=$REPO" >> $GITHUB_OUTPUT
-          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          if [ -z "${OWNER}" ] || [ -z "${REPO}" ] || [ -z "${RUN_ID}" ]; then
+            if [ -n "${RUN_URL}" ]; then
+              read POWNER PREPO PRUNID < <(parse_from_url "$RUN_URL" || echo "")
+              if [ -n "${POWNER:-}" ] && [ -n "${PREPO:-}" ] && [ -n "${PRUNID:-}" ]; then
+                OWNER="$POWNER"
+                REPO="$PREPO"
+                RUN_ID="$PRUNID"
+              fi
+            fi
+          fi
+
+          if [ -z "${OWNER}" ]; then OWNER="${{ github.repository_owner }}"; fi
+          if [ -z "${REPO}" ]; then REPO="${{ github.event.repository.name }}"; fi
+
+          echo "owner=$OWNER"   >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO"     >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
           echo "Artifact Android esperado: ${{ github.event.client_payload.artifact_names.android_apk }}"
           echo "Artifact iOS esperado:     ${{ github.event.client_payload.artifact_names.ios_ipa }}"
 
       - name: Listar artifacts do run (debug robusto)
+        shell: bash
         run: |
+          set -euo pipefail
           URL="https://api.github.com/repos/${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }}/actions/runs/${{ steps.src.outputs.run_id }}/artifacts"
           echo "GET $URL"
           RESP_FILE=$(mktemp)
@@ -48,17 +74,15 @@ jobs:
           BODY=$(head -n -1 "$RESP_FILE")
           CODE=$(tail -n 1 "$RESP_FILE")
           echo "HTTP $CODE"
-          # Mostra chaves para diagnóstico (pode ser message/ documentation_url em erros)
           echo "$BODY" | jq 'keys' || true
           echo "---- Lista (se houver) ----"
           echo "$BODY" | jq -r '.artifacts // [] | .[] | "\(.id)\t\(.name)\texpired=\(.expired)"'
-
           if [ "$CODE" = "404" ]; then
-            echo "::error::404 Not Found - Verifique owner/repo e se o run_id pertence a esse repo."
+            echo "::error::404 Not Found - O run_id não pertence a ${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }}. Confira o payload/URL."
             exit 1
           fi
           if [ "$CODE" = "403" ]; then
-            echo "::error::403 Forbidden - Token sem acesso, ou SSO não autorizado na org."
+            echo "::error::403 Forbidden - Token sem acesso ou SSO não autorizado."
             exit 1
           fi
 
