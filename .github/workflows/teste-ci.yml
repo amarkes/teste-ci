@@ -23,26 +23,43 @@ jobs:
         run: |
           OWNER="${{ github.event.client_payload.source_owner }}"
           REPO="${{ github.event.client_payload.source_repo }}"
-          # fallback para o mesmo repo, se não vier no payload
           if [ -z "$OWNER" ]; then OWNER="${{ github.repository_owner }}"; fi
           if [ -z "$REPO" ]; then REPO="${{ github.event.repository.name }}"; fi
           echo "owner=$OWNER" >> $GITHUB_OUTPUT
           echo "repo=$REPO" >> $GITHUB_OUTPUT
           echo "run_id=${{ github.event.client_payload.workflow_run_id }}" >> $GITHUB_OUTPUT
+          echo "Artifact Android: ${{ github.event.client_payload.artifact_names.android_apk }}"
+          echo "Artifact iOS:     ${{ github.event.client_payload.artifact_names.ios_ipa }}"
 
-      - name: Listar artifacts do run (debug)
+      - name: Listar artifacts do run (debug robusto)
         run: |
-          echo "Listando artifacts de ${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }} run ${{ steps.src.outputs.run_id }}"
-          curl -s -H "Authorization: token ${{ secrets.REPO_ACCESS_TOKEN }}" \
-            "https://api.github.com/repos/${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }}/actions/runs/${{ steps.src.outputs.run_id }}/artifacts" \
-            | jq -r '.artifacts[] | "\(.id)\t\(.name)\texpired=\(.expired)"'
+          URL="https://api.github.com/repos/${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }}/actions/runs/${{ steps.src.outputs.run_id }}/artifacts"
+          echo "GET $URL"
+          RESP_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -w "\n%{http_code}\n" -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ secrets.REPO_ACCESS_TOKEN }}" "$URL" > "$RESP_FILE")
+          BODY=$(head -n -1 "$RESP_FILE")
+          CODE=$(tail -n 1 "$RESP_FILE")
+          echo "HTTP $CODE"
+          echo "$BODY" | jq 'keys' || true
+          echo "---- Lista (se houver) ----"
+          echo "$BODY" | jq -r '.artifacts // [] | .[] | "\(.id)\t\(.name)\texpired=\(.expired)"'
+          # Falhas comuns:
+          if [ "$CODE" = "404" ]; then
+            echo "::error::404 Not Found - Verifique owner/repo e se o run_id pertence a esse repo."
+            exit 1
+          fi
+          if [ "$CODE" = "403" ]; then
+            echo "::error::403 Forbidden - Token sem acesso/SSO não autorizado à org."
+            exit 1
+          fi
 
       - name: Download Android APK artifact
         if: ${{ github.event.client_payload.artifacts.android == 'true' }}
         uses: dawidd6/action-download-artifact@v2
         with:
-          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}   # PAT com acesso ao repo de origem
-          owner: ${{ steps.src.outputs.owner }}
+          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          owner: ${{ steps.src.outputs.owner }}   # << repo de origem correto
           repo: ${{ steps.src.outputs.repo }}
           run_id: ${{ steps.src.outputs.run_id }}
           name: ${{ github.event.client_payload.artifact_names.android_apk }}
@@ -52,8 +69,8 @@ jobs:
         if: ${{ github.event.client_payload.artifacts.ios == 'true' }}
         uses: dawidd6/action-download-artifact@v2
         with:
-          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}   # PAT com acesso ao repo de origem
-          owner: ${{ steps.src.outputs.owner }}
+          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          owner: ${{ steps.src.outputs.owner }}   # << repo de origem correto
           repo: ${{ steps.src.outputs.repo }}
           run_id: ${{ steps.src.outputs.run_id }}
           name: ${{ github.event.client_payload.artifact_names.ios_ipa }}
