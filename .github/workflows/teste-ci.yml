@@ -17,12 +17,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
 
+      # Resolve repositório de origem dos artifacts (pode vir no payload)
+      - name: Resolver repo de origem
+        id: src
+        run: |
+          OWNER="${{ github.event.client_payload.source_owner }}"
+          REPO="${{ github.event.client_payload.source_repo }}"
+          # fallback para o mesmo repo, se não vier no payload
+          if [ -z "$OWNER" ]; then OWNER="${{ github.repository_owner }}"; fi
+          if [ -z "$REPO" ]; then REPO="${{ github.event.repository.name }}"; fi
+          echo "owner=$OWNER" >> $GITHUB_OUTPUT
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          echo "run_id=${{ github.event.client_payload.workflow_run_id }}" >> $GITHUB_OUTPUT
+
+      - name: Listar artifacts do run (debug)
+        run: |
+          echo "Listando artifacts de ${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }} run ${{ steps.src.outputs.run_id }}"
+          curl -s -H "Authorization: token ${{ secrets.REPO_ACCESS_TOKEN }}" \
+            "https://api.github.com/repos/${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }}/actions/runs/${{ steps.src.outputs.run_id }}/artifacts" \
+            | jq -r '.artifacts[] | "\(.id)\t\(.name)\texpired=\(.expired)"'
+
       - name: Download Android APK artifact
         if: ${{ github.event.client_payload.artifacts.android == 'true' }}
         uses: dawidd6/action-download-artifact@v2
         with:
-          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}
-          run_id: ${{ github.event.client_payload.workflow_run_id }}
+          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}   # PAT com acesso ao repo de origem
+          owner: ${{ steps.src.outputs.owner }}
+          repo: ${{ steps.src.outputs.repo }}
+          run_id: ${{ steps.src.outputs.run_id }}
           name: ${{ github.event.client_payload.artifact_names.android_apk }}
           path: ./apk
 
@@ -30,8 +52,10 @@ jobs:
         if: ${{ github.event.client_payload.artifacts.ios == 'true' }}
         uses: dawidd6/action-download-artifact@v2
         with:
-          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}
-          run_id: ${{ github.event.client_payload.workflow_run_id }}
+          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}   # PAT com acesso ao repo de origem
+          owner: ${{ steps.src.outputs.owner }}
+          repo: ${{ steps.src.outputs.repo }}
+          run_id: ${{ steps.src.outputs.run_id }}
           name: ${{ github.event.client_payload.artifact_names.ios_ipa }}
           path: ./ipa
 
@@ -39,24 +63,38 @@ jobs:
         if: ${{ github.event.client_payload.artifacts.android == 'true' }}
         id: upload-apk
         run: |
-          APK_FILE=$(ls ./apk/*.apk | head -n 1)
+          set -e
+          APK_FILE=$(ls ./apk/*.apk | head -n 1 || true)
+          if [ -z "$APK_FILE" ]; then
+            echo "Nenhum APK encontrado em ./apk"; exit 1
+          fi
           echo "Encontrado APK: $APK_FILE"
           RESP=$(curl -s -u "$BS_USER:$BS_KEY" -X POST "https://api-cloud.browserstack.com/app-automate/upload" \
                  -F "file=@$APK_FILE")
           echo "$RESP"
-          APP_URL=$(echo "$RESP" | jq -r '.app_url')
+          APP_URL=$(echo "$RESP" | jq -r '.app_url // empty')
+          if [ -z "$APP_URL" ]; then
+            echo "Falha ao obter app_url do BrowserStack"; exit 1
+          fi
           echo "app_url=$APP_URL" >> $GITHUB_OUTPUT
 
       - name: Upload IPA to BrowserStack Automated
         if: ${{ github.event.client_payload.artifacts.ios == 'true' }}
         id: upload-ipa
         run: |
-          IPA_FILE=$(ls ./ipa/*.ipa | head -n 1)
+          set -e
+          IPA_FILE=$(ls ./ipa/*.ipa | head -n 1 || true)
+          if [ -z "$IPA_FILE" ]; then
+            echo "Nenhum IPA encontrado em ./ipa"; exit 1
+          fi
           echo "Encontrado IPA: $IPA_FILE"
           RESP=$(curl -s -u "$BS_USER:$BS_KEY" -X POST "https://api-cloud.browserstack.com/app-automate/upload" \
                  -F "file=@$IPA_FILE")
           echo "$RESP"
-          APP_URL=$(echo "$RESP" | jq -r '.app_url')
+          APP_URL=$(echo "$RESP" | jq -r '.app_url // empty')
+          if [ -z "$APP_URL" ]; then
+            echo "Falha ao obter app_url do BrowserStack"; exit 1
+          fi
           echo "app_url=$APP_URL" >> $GITHUB_OUTPUT
 
       - name: Summary
@@ -64,15 +102,16 @@ jobs:
           {
             echo "### BrowserStack Upload Summary"
             echo ""
-            echo "**Platform:** ${{ github.event.client_payload.platform }}"
-            echo "**Version:**  ${{ github.event.client_payload.version }}"
-            echo "**Build:**    ${{ github.event.client_payload.build }}"
+            echo "**Source repo:** ${{ steps.src.outputs.owner }}/${{ steps.src.outputs.repo }}"
+            echo "**Platform:**    ${{ github.event.client_payload.platform }}"
+            echo "**Version:**     ${{ github.event.client_payload.version }}"
+            echo "**Build:**       ${{ github.event.client_payload.build }}"
             if [ "${{ github.event.client_payload.artifacts.android }}" = "true" ]; then
               echo ""
-              echo "- Android APK URL: \`${{ steps.upload-apk.outputs.app_url }}\`"
+              echo "- **Android APK URL:** \`${{ steps.upload-apk.outputs.app_url }}\`"
             fi
             if [ "${{ github.event.client_payload.artifacts.ios }}" = "true" ]; then
               echo ""
-              echo "- iOS IPA URL: \`${{ steps.upload-ipa.outputs.app_url }}\`"
+              echo "- **iOS IPA URL:** \`${{ steps.upload-ipa.outputs.app_url }}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
