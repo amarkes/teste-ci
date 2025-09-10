@@ -1,0 +1,157 @@
+name: Backup CI - TESTE
+
+on:
+  repository_dispatch:
+    types: [CI_TESTE2]
+
+env:
+  BS_USER: ${{ secrets.BROWSERSTACK_USERNAME }}
+  BS_KEY:  ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+
+jobs:
+  upload-apps:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Resolver repo de origem e run_id
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OWNER="${{ github.event.client_payload.source_owner }}"
+          REPO="${{ github.event.client_payload.source_repo }}"
+          RUN_ID="${{ github.event.client_payload.workflow_run_id }}"
+          RUN_URL="${{ github.event.client_payload.workflow_run_url }}"
+
+          parse_from_url() {
+            local url="$1"
+            if [[ "$url" =~ github\.com/([^/]+)/([^/]+)/actions/runs/([0-9]+) ]]; then
+              echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+              return 0
+            fi
+            return 1
+          }
+
+          # Se faltar algum campo, tenta a URL
+          if [[ -z "${OWNER}" || -z "${REPO}" || -z "${RUN_ID}" ]]; then
+            if [[ -n "${RUN_URL}" ]]; then
+              if parse=$(parse_from_url "$RUN_URL"); then
+                read POWNER PREPO PRUNID <<< "$parse"
+                OWNER="${OWNER:-$POWNER}"
+                REPO="${REPO:-$PREPO}"
+                RUN_ID="${RUN_ID:-$PRUNID}"
+              fi
+            fi
+          fi
+
+          # Fallback final pro próprio repo (não recomendado)
+          OWNER="${OWNER:-${{ github.repository_owner }}}"
+          REPO="${REPO:-${{ github.event.repository.name }}}"
+
+          echo "owner=$OWNER"        >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO"          >> "$GITHUB_OUTPUT"
+          echo "full_repo=$OWNER/$REPO" >> "$GITHUB_OUTPUT"
+          echo "run_id=$RUN_ID"      >> "$GITHUB_OUTPUT"
+
+          # Log de conferência
+          echo ">> full_repo: $OWNER/$REPO"
+          echo ">> run_id:    $RUN_ID"
+          echo ">> APK name:  ${{ github.event.client_payload.artifact_names.android_apk }}"
+          echo ">> IPA name:  ${{ github.event.client_payload.artifact_names.ios_ipa }}"
+
+      - name: Listar artifacts do run (debug)
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://api.github.com/repos/${{ steps.src.outputs.full_repo }}/actions/runs/${{ steps.src.outputs.run_id }}/artifacts"
+          echo "GET $URL"
+          RESP_FILE=$(mktemp)
+          curl -sS -w "\n%{http_code}\n" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ secrets.REPO_ACCESS_TOKEN }}" \
+            "$URL" > "$RESP_FILE"
+          BODY=$(head -n -1 "$RESP_FILE")
+          CODE=$(tail -n 1 "$RESP_FILE")
+          echo "HTTP $CODE"
+          echo "$BODY" | jq -r '.artifacts // [] | .[] | "\(.id)\t\(.name)\texpired=\(.expired)"'
+          if [ "$CODE" = "404" ]; then
+            echo "::error::404 Not Found - Confira se o run_id pertence a ${{ steps.src.outputs.full_repo }}"; exit 1
+          fi
+          if [ "$CODE" = "403" ]; then
+            echo "::error::403 Forbidden - Token sem acesso ou SSO não autorizado na org"; exit 1
+          fi
+
+      - name: Download Android APK artifact
+        if: ${{ github.event.client_payload.artifacts.android == 'true' }}
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          repo: ${{ steps.src.outputs.full_repo }}                 # << aqui é owner/repo
+          run_id: ${{ steps.src.outputs.run_id }}
+          name: ${{ github.event.client_payload.artifact_names.android_apk }}
+          path: ./apk
+          if_no_artifact_found: error
+          search_artifacts: false
+          check_artifacts: true
+
+      - name: Download iOS IPA artifact
+        if: ${{ github.event.client_payload.artifacts.ios == 'true' }}
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          github_token: ${{ secrets.REPO_ACCESS_TOKEN }}
+          repo: ${{ steps.src.outputs.full_repo }}                 # << aqui é owner/repo
+          run_id: ${{ steps.src.outputs.run_id }}
+          name: ${{ github.event.client_payload.artifact_names.ios_ipa }}
+          path: ./ipa
+          if_no_artifact_found: error
+          search_artifacts: false
+          check_artifacts: true
+
+      - name: Upload APK to BrowserStack Automated
+        if: ${{ github.event.client_payload.artifacts.android == 'true' }}
+        id: upload-apk
+        run: |
+          set -e
+          APK_FILE=$(ls ./apk/*.apk | head -n 1 || true)
+          if [ -z "$APK_FILE" ]; then echo "Nenhum APK encontrado"; exit 1; fi
+          RESP=$(curl -s -u "$BS_USER:$BS_KEY" -X POST "https://api-cloud.browserstack.com/app-automate/upload" \
+                 -F "file=@$APK_FILE")
+          echo "$RESP"
+          APP_URL=$(echo "$RESP" | jq -r '.app_url // empty')
+          if [ -z "$APP_URL" ]; then echo "Falha ao obter app_url"; exit 1; fi
+          echo "app_url=$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Upload IPA to BrowserStack Automated
+        if: ${{ github.event.client_payload.artifacts.ios == 'true' }}
+        id: upload-ipa
+        run: |
+          set -e
+          IPA_FILE=$(ls ./ipa/*.ipa | head -n 1 || true)
+          if [ -z "$IPA_FILE" ]; then echo "Nenhum IPA encontrado"; exit 1; fi
+          RESP=$(curl -s -u "$BS_USER:$BS_KEY" -X POST "https://api-cloud.browserstack.com/app-automate/upload" \
+                 -F "file=@$IPA_FILE")
+          echo "$RESP"
+          APP_URL=$(echo "$RESP" | jq -r '.app_url // empty')
+          if [ -z "$APP_URL" ]; then echo "Falha ao obter app_url"; exit 1; fi
+          echo "app_url=$APP_URL" >> $GITHUB_OUTPUT
+
+      - name: Summary
+        run: |
+          {
+            echo "### BrowserStack Upload Summary"
+            echo ""
+            echo "**Source repo:** ${{ steps.src.outputs.full_repo }}"
+            echo "**Run ID:**      ${{ steps.src.outputs.run_id }}"
+            echo "**Platform:**    ${{ github.event.client_payload.platform }}"
+            echo "**Version:**     ${{ github.event.client_payload.version }}"
+            echo "**Build:**       ${{ github.event.client_payload.build }}"
+            if [ "${{ github.event.client_payload.artifacts.android }}" = "true" ]; then
+              echo ""
+              echo "- **Android APK URL:** \`${{ steps.upload-apk.outputs.app_url }}\`"
+            fi
+            if [ "${{ github.event.client_payload.artifacts.ios }}" = "true" ]; then
+              echo ""
+              echo "- **iOS IPA URL:** \`${{ steps.upload-ipa.outputs.app_url }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
